@@ -1,0 +1,104 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: contract_management
+      POSTGRES_USER: contract
+      POSTGRES_PASSWORD: contract
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "contract", "-d", "contract_management"]
+      interval: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_HOSTNAME: http://localhost:8180
+    ports:
+      - "8180:8080"
+    volumes:
+      - ./keycloak/contract-management-realm.json:/opt/keycloak/data/import/contract-management-realm.json:ro
+
+  # Local LLM for the document Q&A (profile "rag"). On a Mac, a native Ollama is much faster (GPU), see README.
+  ollama:
+    profiles: [rag]
+    image: ollama/ollama:0.40.17
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      retries: 20
+
+  # One-off: downloads the models on first start (~3 GB), later starts reuse the volume.
+  ollama-models:
+    profiles: [rag]
+    image: ollama/ollama:0.40.17
+    depends_on:
+      ollama: { condition: service_healthy }
+    environment:
+      OLLAMA_HOST: ollama:11434
+    entrypoint: ["sh", "-c", "ollama pull ${OLLAMA_EMBEDDING_MODEL:-bge-m3} && ollama pull ${OLLAMA_CHAT_MODEL:-qwen2.5:3b}"]
+
+  app:
+    profiles: [app]
+    image: ${APP_IMAGE:-ghcr.io/yusuf-akcay/contract-management:latest}
+    build: .
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      keycloak: { condition: service_started }
+      ollama-models: { condition: service_completed_successfully, required: false }
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      DATABASE_URL: jdbc:postgresql://postgres:5432/contract_management
+      RABBITMQ_HOST: rabbitmq
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5:3b}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-bge-m3}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      MIN_SIMILARITY: ${MIN_SIMILARITY:-0.35}
+      OAUTH2_ISSUER_URI: http://localhost:8180/realms/contract-management
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/realms/contract-management/protocol/openid-connect/certs
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 10s
+      retries: 30
+
+  # React frontend (repository contract-management-ui) on http://localhost:3000.
+  # nginx there proxies /api to the app, so browser and API share one origin.
+  ui:
+    profiles: [ui]
+    image: ${UI_IMAGE:-ghcr.io/yusuf-akcay/contract-management-ui:latest}
+    depends_on:
+      app: { condition: service_healthy }
+    environment:
+      API_UPSTREAM: http://app:8080
+      KEYCLOAK_URL: http://localhost:8180
+      KEYCLOAK_REALM: contract-management
+      KEYCLOAK_CLIENT_ID: contract-management-ui
+    ports:
+      - "3000:3000"
+
+volumes:
+  ollama:

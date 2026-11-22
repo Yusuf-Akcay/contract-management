@@ -1,0 +1,116 @@
+# test -> verify -> docker -> smoke, then publish to ghcr.io (main only). Nothing is deployed.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with: { distribution: temurin, java-version: 25, cache: maven }
+      - run: ./mvnw -B test
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with: { name: unit-test-reports, path: target/surefire-reports/ }
+
+  verify:
+    name: Integration tests + package
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with: { distribution: temurin, java-version: 25, cache: maven }
+      - run: ./mvnw -B verify
+      - uses: actions/upload-artifact@v7
+        with: { name: app-jar, path: target/*.jar, retention-days: 1 }
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports
+          path: |
+            target/surefire-reports/
+            target/failsafe-reports/
+
+  docker:
+    name: Build image
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with: { name: app-jar, path: target }
+      - run: docker build -t contract-management:local .
+      - run: docker save contract-management:local | gzip > image.tar.gz
+      - uses: actions/upload-artifact@v7
+        with: { name: app-image, path: image.tar.gz, retention-days: 1 }
+
+  smoke:
+    name: Smoke test
+    needs: docker
+    runs-on: ubuntu-latest
+    env:
+      APP_IMAGE: contract-management:local
+      OLLAMA_CHAT_MODEL: qwen2.5:0.5b
+      OLLAMA_EMBEDDING_MODEL: all-minilm
+      EMBEDDING_DIMENSIONS: 384
+      MIN_SIMILARITY: 0
+      SMOKE_RAG: 1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with: { name: app-image }
+      - run: gunzip -c image.tar.gz | docker load
+      # Tiny models keep the download small (~0.5 GB); the RAG plumbing is the same as with the demo models
+      - run: docker compose --profile app --profile rag up -d --no-build
+      - run: ./scripts/smoke-test.sh
+      - if: failure()
+        run: docker compose --profile app --profile rag logs app ollama-models
+      - if: always()
+        run: docker compose --profile app --profile rag down
+
+  publish:
+    name: Publish image
+    needs: smoke
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with: { name: app-jar, path: target }
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

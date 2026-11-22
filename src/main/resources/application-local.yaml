@@ -1,0 +1,7 @@
+spring:
+  flyway:
+    locations: classpath:db/migration,classpath:db/demo
+
+app:
+  documents:
+    demo-document: classpath:demo/avb-hausrat-demo.pdf
